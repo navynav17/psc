@@ -1,170 +1,208 @@
 import asyncio
 import json
 import re
-from urllib.parse import urlparse
+from html import unescape
+from urllib.parse import urljoin, urlparse
 
 import requests
-
+from bs4 import BeautifulSoup
 from apify import Actor
 
 START_URL = "https://www.psc.guru/mcqs/practice"
+USER_AGENT = "Mozilla/5.0 (compatible; PSC-Guru-MCQ-Collector/1.0)"
 
 
 def clean(value):
-    return re.sub(r"\s+", " ", value or "").strip()
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def extract_questions_from_json(data, source_url):
-    results = []
-    seen = set()
+def question_record(node, source_url):
+    if not isinstance(node, dict):
+        return None
 
-    def walk(node):
-        if isinstance(node, dict):
-            q = None
-            for key in ("question", "questionText", "text", "title"):
-                value = node.get(key)
-                if isinstance(value, str) and len(clean(value)) >= 8:
-                    q = clean(value)
-                    if key == "title" and "?" not in q and len(q) < 20:
-                        q = None
-                    break
+    q = None
+    for key in ("question", "questionText", "question_text"):
+        value = node.get(key)
+        if isinstance(value, str) and len(clean(value)) >= 8:
+            q = clean(value)
+            break
 
-            options = []
-            for key in ("options", "choices", "answers", "alternatives"):
-                value = node.get(key)
-                if isinstance(value, list):
-                    for idx, item in enumerate(value[:4]):
-                        if isinstance(item, str):
-                            options.append({"label": chr(65 + idx), "text": clean(item)})
-                        elif isinstance(item, dict):
-                            text = clean(item.get("text") or item.get("label") or item.get("value"))
-                            if text:
-                                options.append({"label": chr(65 + idx), "text": text})
-                    if options:
-                        break
+    options_value = None
+    for key in ("options", "choices", "answers", "alternatives"):
+        if key in node:
+            options_value = node[key]
+            break
 
-            if q and len(options) >= 2:
-                key = q.casefold()
-                if key not in seen:
-                    seen.add(key)
-                    record = {
-                        "question": q,
-                        "options": options[:4],
-                        "source": "PSC Guru",
-                        "source_url": source_url,
-                    }
-                    for answer_key in ("correctAnswer", "correct_answer", "answer", "correctOption"):
-                        if answer_key in node:
-                            record["correctAnswer"] = node[answer_key]
-                            break
-                    for solution_key in ("solution", "explanation", "explanationText"):
-                        if isinstance(node.get(solution_key), str) and clean(node[solution_key]):
-                            record["solution"] = clean(node[solution_key])
-                            break
-                    results.append(record)
+    if not q or not isinstance(options_value, (list, dict)):
+        return None
 
-            for value in node.values():
-                walk(value)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
+    options = []
+    items = enumerate(options_value) if isinstance(options_value, list) else options_value.items()
+    for idx, item in items:
+        if isinstance(item, dict):
+            text = item.get("text") or item.get("label") or item.get("value") or item.get("answer")
+        else:
+            text = item
+        text = clean(text)
+        if text:
+            label = chr(65 + idx) if isinstance(idx, int) and idx < 26 else str(idx)
+            options.append({"label": label, "text": text})
 
-    walk(data)
-    return results
+    if len(options) < 2:
+        return None
 
+    record = {
+        "question": q,
+        "options": options[:10],
+        "source": "PSC Guru",
+        "source_url": source_url,
+    }
 
-def fetch_json(url):
-    response = requests.get(
-        url,
-        timeout=60,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; PSC-Guru-Apify-Collector/1.0)",
-            "Accept": "application/json,text/plain,*/*",
-        },
-    )
-    response.raise_for_status()
-    return response.json()
+    for key in ("correctAnswer", "correct_answer", "answer", "correctOption", "correct_option"):
+        if key in node:
+            record["correctAnswer"] = node[key]
+            break
+
+    for key in ("solution", "explanation", "explanationText"):
+        if isinstance(node.get(key), str) and clean(node[key]):
+            record["solution"] = clean(node[key])
+            break
+
+    for key in ("chapter", "subject", "category", "exam", "examType", "difficulty", "id", "questionId"):
+        if key in node:
+            record[key] = node[key]
+
+    return record
 
 
-def discover_json_urls(html, base_url):
+def walk_json(node, source_url, output, seen):
+    if isinstance(node, dict):
+        record = question_record(node, source_url)
+        if record:
+            k = record["question"].casefold()
+            if k not in seen:
+                seen.add(k)
+                output.append(record)
+        for value in node.values():
+            walk_json(value, source_url, output, seen)
+    elif isinstance(node, list):
+        for item in node:
+            walk_json(item, source_url, output, seen)
+
+
+def extract_next_data(html):
+    soup = BeautifulSoup(html, "html.parser")
+    data = []
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if tag and tag.string:
+        try:
+            data.append(json.loads(tag.string))
+        except json.JSONDecodeError:
+            pass
+    return data
+
+
+def extract_embedded_json(html):
+    data = []
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all("script"):
+        text = tag.string or tag.get_text()
+        if not text:
+            continue
+        stripped = text.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                data.append(json.loads(stripped))
+            except json.JSONDecodeError:
+                continue
+    return data
+
+
+def discover_real_api_urls(html):
     urls = set()
-    for match in re.findall(r'''["']([^"']+\.json(?:\?[^"']*)?)["']''', html, re.I):
-        if match.startswith("//"):
-            match = "https:" + match
-        elif match.startswith("/"):
-            match = "https://www.psc.guru" + match
-        elif not match.startswith("http"):
-            match = base_url.rstrip("/") + "/" + match.lstrip("/")
-        urls.add(match)
+    # Only capture explicit API-looking strings, not arbitrary HTML text.
+    patterns = [
+        r'["\'](\/api\/[A-Za-z0-9_?=&\-./]+)["\']',
+        r'["\'](\/trpc\/[A-Za-z0-9_?=&\-./]+)["\']',
+        r'["\'](\/graphql[^"\']*)["\']',
+        r'["\'](https?://[^"\']+\/api\/[^"\']+)["\']',
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, html, re.I):
+            urls.add(match)
     return urls
 
 
+def absolute(url):
+    return urljoin(START_URL, url)
+
+
 def main_sync():
-    Actor.log.info(f"Opening public PSC Guru page: {START_URL}")
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; PSC-Guru-Apify-Collector/1.0)"
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
     })
 
+    print(f"[1] GET {START_URL}", flush=True)
     response = session.get(START_URL, timeout=60)
     response.raise_for_status()
-    Actor.log.info(f"HTTP {response.status_code} | {response.url}")
+    print(f"[OK] HTTP {response.status_code} | {len(response.content):,} bytes", flush=True)
 
-    json_urls = discover_json_urls(response.text, START_URL)
-    Actor.log.info(f"Discovered {len(json_urls)} JSON candidates in page source.")
+    html = response.text
+    candidates = set()
+    candidates.update(absolute(x) for x in discover_real_api_urls(html))
 
-    # Also try common API paths used by frontend applications.
     parsed = urlparse(START_URL)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    common_paths = [
-        "/api/mcqs/practice",
-        "/api/mcqs",
-        "/api/questions",
-        "/api/questions/practice",
-        "/api/mcq",
-    ]
-    json_urls.update(origin + path for path in common_paths)
+    candidates.update({
+        origin + "/api/mcqs/practice",
+        origin + "/api/mcqs",
+        origin + "/api/questions",
+        origin + "/api/questions/practice",
+    })
 
-    total = 0
-    seen_urls = set()
-    for url in list(json_urls):
-        if url in seen_urls:
+    payloads = []
+    payloads.extend(extract_next_data(html))
+    payloads.extend(extract_embedded_json(html))
+
+    records = []
+    seen = set()
+
+    for payload in payloads:
+        walk_json(payload, START_URL, records, seen)
+
+    print(f"[2] MCQs found in embedded JSON: {len(records)}", flush=True)
+    print(f"[3] API candidates: {len(candidates)}", flush=True)
+
+    for url in sorted(candidates):
+        if urlparse(url).netloc != parsed.netloc:
             continue
-        seen_urls.add(url)
         try:
-            Actor.log.info(f"Trying JSON endpoint: {url}")
-            payload = fetch_json(url)
-            questions = extract_questions_from_json(payload, url)
-            Actor.log.info(f"Extracted {len(questions)} MCQs from {url}")
-            for record in questions:
-                asyncio.run(Actor.push_data(record))
-                total += 1
-        except Exception as exc:
-            Actor.log.info(f"Skipped {url}: {exc}")
+            print(f"[API] {url}", flush=True)
+            r = session.get(url, timeout=60, headers={"Accept": "application/json,text/plain,*/*"})
+            print(f"      HTTP {r.status_code} | {r.headers.get('content-type','')}", flush=True)
+            if r.status_code != 200:
+                continue
+            try:
+                payload = r.json()
+            except ValueError:
+                continue
+            walk_json(payload, url, records, seen)
+        except requests.RequestException as exc:
+            print(f"      skipped: {exc}", flush=True)
 
-    # Save raw page HTML metadata even if no JSON endpoint was exposed.
-    if total == 0:
-        awaitable = Actor.push_data({
-            "source": "PSC Guru",
-            "source_url": START_URL,
-            "type": "diagnostic",
-            "message": "No JSON MCQ endpoint was discovered from the public practice page.",
-            "http_status": response.status_code,
-            "content_type": response.headers.get("content-type"),
-        })
-        asyncio.run(awaitable)
+    print(f"[DONE] UNIQUE MCQs: {len(records)}", flush=True)
 
-    Actor.log.info(f"DONE | total extracted unique MCQs: {total}")
+    return records
 
 
 async def main():
     async with Actor:
-        try:
-            # Run blocking requests in a worker thread so the Apify Actor remains responsive.
-            await asyncio.to_thread(main_sync)
-        except Exception as exc:
-            Actor.log.error(f"FATAL: {type(exc).__name__}: {exc}")
-            raise
+        records = await asyncio.to_thread(main_sync)
+        for record in records:
+            await Actor.push_data(record)
+        Actor.log.info(f"Saved {len(records)} unique MCQs to Apify Dataset")
 
 
 if __name__ == "__main__":
