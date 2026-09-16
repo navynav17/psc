@@ -1,231 +1,169 @@
-import os
-import re
 import asyncio
-import traceback
+import json
+import re
 from urllib.parse import urlparse
 
-from apify import Actor
-from playwright.async_api import async_playwright
+import requests
 
+from apify import Actor
 
 START_URL = "https://www.psc.guru/mcqs/practice"
 
 
-def clean(text):
-    return re.sub(r"\s+", " ", text or "").strip()
+def clean(value):
+    return re.sub(r"\s+", " ", value or "").strip()
 
 
-async def first_visible(page, selectors):
-    for selector in selectors:
-        loc = page.locator(selector).first
-        try:
-            if await loc.is_visible():
-                return loc
-        except Exception:
-            pass
-    return None
-
-
-async def login(page, email, password):
-    Actor.log.info(f"Opening PSC Guru: {START_URL}")
-    await page.goto(START_URL, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(1500)
-    Actor.log.info(f"Initial page URL: {page.url}")
-
-    if "login" not in page.url.lower():
-        password_input = page.locator('input[type="password"]').first
-        try:
-            if not await password_input.is_visible():
-                Actor.log.info("Already authenticated; no login form detected.")
-                return
-        except Exception:
-            Actor.log.info("Already authenticated; no login form detected.")
-            return
-
-    Actor.log.info("Login form detected; filling credentials.")
-
-    email_input = await first_visible(page, [
-        'input[type="email"]',
-        'input[name*="email" i]',
-        'input[placeholder*="email" i]',
-    ])
-    password_input = await first_visible(page, [
-        'input[type="password"]',
-        'input[name*="password" i]',
-    ])
-
-    if not email_input or not password_input:
-        raise RuntimeError("PSC Guru login form was not detected.")
-
-    await email_input.fill(email)
-    await password_input.fill(password)
-
-    submit = await first_visible(page, [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button:has-text("Login")',
-        'button:has-text("Sign in")',
-        'button:has-text("Log in")',
-    ])
-    if not submit:
-        raise RuntimeError("PSC Guru login submit button was not detected.")
-
-    await submit.click()
-    try:
-        await page.wait_for_load_state("domcontentloaded", timeout=60000)
-    except Exception:
-        Actor.log.warning("Post-login navigation did not reach domcontentloaded; continuing.")
-    await page.wait_for_timeout(2000)
-
-    Actor.log.info(f"Post-login page URL: {page.url}")
-
-    if "login" in page.url.lower():
-        raise RuntimeError("PSC Guru login did not complete. Check Actor input email/password.")
-
-
-async def extract_question(page, source_url):
-    containers = page.locator(
-        '[data-question], [class*="question" i], article, .card, li'
-    )
-    count = min(await containers.count(), 200)
-
+def extract_questions_from_json(data, source_url):
     results = []
     seen = set()
 
-    for i in range(count):
-        c = containers.nth(i)
-        try:
-            raw = clean(await c.inner_text())
-        except Exception:
-            continue
-        if len(raw) < 20:
-            continue
+    def walk(node):
+        if isinstance(node, dict):
+            q = None
+            for key in ("question", "questionText", "text", "title"):
+                value = node.get(key)
+                if isinstance(value, str) and len(clean(value)) >= 8:
+                    q = clean(value)
+                    if key == "title" and "?" not in q and len(q) < 20:
+                        q = None
+                    break
 
-        lines = [clean(x) for x in raw.split("\n") if clean(x)]
-        opts = []
-        first_opt = None
+            options = []
+            for key in ("options", "choices", "answers", "alternatives"):
+                value = node.get(key)
+                if isinstance(value, list):
+                    for idx, item in enumerate(value[:4]):
+                        if isinstance(item, str):
+                            options.append({"label": chr(65 + idx), "text": clean(item)})
+                        elif isinstance(item, dict):
+                            text = clean(item.get("text") or item.get("label") or item.get("value"))
+                            if text:
+                                options.append({"label": chr(65 + idx), "text": text})
+                    if options:
+                        break
 
-        for idx, line in enumerate(lines):
-            m = re.match(r"^([A-D])[.)\s]+(.+)$", line, re.I)
-            if m:
-                if first_opt is None:
-                    first_opt = idx
-                opts.append({"label": m.group(1).upper(), "text": clean(m.group(2))})
+            if q and len(options) >= 2:
+                key = q.casefold()
+                if key not in seen:
+                    seen.add(key)
+                    record = {
+                        "question": q,
+                        "options": options[:4],
+                        "source": "PSC Guru",
+                        "source_url": source_url,
+                    }
+                    for answer_key in ("correctAnswer", "correct_answer", "answer", "correctOption"):
+                        if answer_key in node:
+                            record["correctAnswer"] = node[answer_key]
+                            break
+                    for solution_key in ("solution", "explanation", "explanationText"):
+                        if isinstance(node.get(solution_key), str) and clean(node[solution_key]):
+                            record["solution"] = clean(node[solution_key])
+                            break
+                    results.append(record)
 
-        if len(opts) < 2 or first_opt is None:
-            continue
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
 
-        qtext = clean(" ".join(lines[:first_opt]))
-        if len(qtext) < 8:
-            continue
-
-        key = qtext.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        results.append({
-            "question": qtext,
-            "options": opts[:4],
-            "source_url": source_url,
-        })
-
+    walk(data)
     return results
 
 
-async def run():
-    actor_input = await Actor.get_input() or {}
-    Actor.log.info(f"Actor input keys: {sorted(actor_input.keys())}")
+def fetch_json(url):
+    response = requests.get(
+        url,
+        timeout=60,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; PSC-Guru-Apify-Collector/1.0)",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+    response.raise_for_status()
+    return response.json()
 
-    email = actor_input.get("email") or os.environ.get("PSC_GURU_EMAIL")
-    password = actor_input.get("password") or os.environ.get("PSC_GURU_PASSWORD")
-    start_url = actor_input.get("startUrl", START_URL)
-    max_pages = int(actor_input.get("maxPages", 100))
-    max_questions = int(actor_input.get("maxQuestions", 10000))
 
-    if not email or not password:
-        raise RuntimeError(
-            "Provide PSC Guru credentials in Actor input or PSC_GURU_EMAIL/PSC_GURU_PASSWORD secrets."
-        )
+def discover_json_urls(html, base_url):
+    urls = set()
+    for match in re.findall(r'''["']([^"']+\.json(?:\?[^"']*)?)["']''', html, re.I):
+        if match.startswith("//"):
+            match = "https:" + match
+        elif match.startswith("/"):
+            match = "https://www.psc.guru" + match
+        elif not match.startswith("http"):
+            match = base_url.rstrip("/") + "/" + match.lstrip("/")
+        urls.add(match)
+    return urls
 
-    Actor.log.info("Starting PSC Guru collector...")
 
-    async with async_playwright() as pw:
-        Actor.log.info("Launching Chromium...")
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (compatible; PSC-Guru-Apify-Collector/1.0)"
-        )
-        page = await context.new_page()
+def main_sync():
+    Actor.log.info(f"Opening public PSC Guru page: {START_URL}")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; PSC-Guru-Apify-Collector/1.0)"
+    })
 
+    response = session.get(START_URL, timeout=60)
+    response.raise_for_status()
+    Actor.log.info(f"HTTP {response.status_code} | {response.url}")
+
+    json_urls = discover_json_urls(response.text, START_URL)
+    Actor.log.info(f"Discovered {len(json_urls)} JSON candidates in page source.")
+
+    # Also try common API paths used by frontend applications.
+    parsed = urlparse(START_URL)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    common_paths = [
+        "/api/mcqs/practice",
+        "/api/mcqs",
+        "/api/questions",
+        "/api/questions/practice",
+        "/api/mcq",
+    ]
+    json_urls.update(origin + path for path in common_paths)
+
+    total = 0
+    seen_urls = set()
+    for url in list(json_urls):
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
         try:
-            await login(page, email, password)
-            await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(1000)
-            Actor.log.info(f"Starting crawl at: {page.url}")
+            Actor.log.info(f"Trying JSON endpoint: {url}")
+            payload = fetch_json(url)
+            questions = extract_questions_from_json(payload, url)
+            Actor.log.info(f"Extracted {len(questions)} MCQs from {url}")
+            for record in questions:
+                asyncio.run(Actor.push_data(record))
+                total += 1
+        except Exception as exc:
+            Actor.log.info(f"Skipped {url}: {exc}")
 
-            visited = set()
-            emitted = set()
-            queue = [page.url]
+    # Save raw page HTML metadata even if no JSON endpoint was exposed.
+    if total == 0:
+        awaitable = Actor.push_data({
+            "source": "PSC Guru",
+            "source_url": START_URL,
+            "type": "diagnostic",
+            "message": "No JSON MCQ endpoint was discovered from the public practice page.",
+            "http_status": response.status_code,
+            "content_type": response.headers.get("content-type"),
+        })
+        asyncio.run(awaitable)
 
-            while queue and len(visited) < max_pages and len(emitted) < max_questions:
-                url = queue.pop(0)
-                if url in visited:
-                    continue
-                visited.add(url)
-
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    await page.wait_for_timeout(1000)
-                except Exception as exc:
-                    Actor.log.warning(f"Page failed: {url} :: {exc}")
-                    continue
-
-                questions = await extract_question(page, url)
-                for q in questions:
-                    key = clean(q["question"]).casefold()
-                    if key in emitted:
-                        continue
-                    emitted.add(key)
-                    await Actor.push_data({
-                        **q,
-                        "source": "PSC Guru",
-                        "source_url": url,
-                    })
-                    if len(emitted) >= max_questions:
-                        break
-
-                links = await page.locator("a[href]").evaluate_all(
-                    """els => els.map(a => ({href:a.href, text:(a.innerText||'').trim()}))"""
-                )
-                for item in links:
-                    href = item.get("href", "")
-                    label = clean(item.get("text", ""))
-                    if not href or href in visited or href in queue:
-                        continue
-                    parsed = urlparse(href)
-                    if parsed.netloc and parsed.netloc != "www.psc.guru":
-                        continue
-                    low = (href + " " + label).lower()
-                    if any(k in low for k in ("mcq", "practice", "question", "quiz")):
-                        queue.append(href)
-
-                Actor.log.info(
-                    f"Visited {len(visited)} pages | emitted {len(emitted)} unique MCQs | queue {len(queue)}"
-                )
-
-        finally:
-            await browser.close()
-            Actor.log.info("Browser closed.")
+    Actor.log.info(f"DONE | total extracted unique MCQs: {total}")
 
 
 async def main():
     async with Actor:
         try:
-            await run()
+            # Run blocking requests in a worker thread so the Apify Actor remains responsive.
+            await asyncio.to_thread(main_sync)
         except Exception as exc:
             Actor.log.error(f"FATAL: {type(exc).__name__}: {exc}")
-            Actor.log.error(traceback.format_exc())
             raise
 
 
