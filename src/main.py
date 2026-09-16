@@ -9,7 +9,7 @@ from apify import Actor
 START_URL = "https://www.psc.guru/mcqs/practice"
 API_BASE = "https://api.psc.guru/api"
 PAGE_SIZE = 100
-MAX_REPEATED_PAGES = 3
+MAX_PAGE = 200
 
 
 def clean(value):
@@ -25,26 +25,45 @@ def normalize_question(text):
 def normalize_options(content):
     if not isinstance(content, dict):
         return []
+
     value = content.get("options")
     if not isinstance(value, (list, dict)):
         return []
 
     output = []
+
     if isinstance(value, list):
         for index, item in enumerate(value):
-            text = item.get("text") if isinstance(item, dict) else item
-            text = clean(text or (item.get("label") if isinstance(item, dict) else ""))
+            if isinstance(item, dict):
+                text = clean(
+                    item.get("text")
+                    or item.get("label")
+                    or item.get("value")
+                    or item.get("answer")
+                )
+            else:
+                text = clean(item)
+
             if text:
                 output.append({
-                    "label": chr(65 + index) if index < 26 else str(index + 1),
+                    "key": item.get("key") if isinstance(item, dict) else (chr(65 + index) if index < 26 else str(index + 1)),
                     "text": text,
                 })
     else:
         for label, item in value.items():
-            text = item.get("text") if isinstance(item, dict) else item
-            text = clean(text or (item.get("label") if isinstance(item, dict) else ""))
+            if isinstance(item, dict):
+                text = clean(
+                    item.get("text")
+                    or item.get("label")
+                    or item.get("value")
+                    or item.get("answer")
+                )
+            else:
+                text = clean(item)
+
             if text:
-                output.append({"label": str(label), "text": text})
+                output.append({"key": str(label), "text": text})
+
     return output
 
 
@@ -57,14 +76,18 @@ def build_record(item, source_url):
         or item.get("question")
         or item.get("text")
     )
+
     if len(question) < 5:
         return None
 
-    options = normalize_options(item.get("content"))
+    content = item.get("content")
+    if not isinstance(content, dict):
+        content = {}
+
+    options = normalize_options(content)
     if len(options) < 2:
         return None
 
-    content = item.get("content") or {}
     return {
         "id": item.get("id"),
         "questionText": question,
@@ -78,7 +101,7 @@ def build_record(item, source_url):
             "visualDescription": content.get("visualDescription"),
         },
         "difficulty": item.get("difficulty"),
-        "tags": item.get("tags", []),
+        "tags": item.get("tags") or [],
         "svgCode": item.get("svgCode"),
         "correctAnswer": item.get("correctAnswer"),
         "explanation": item.get("explanation"),
@@ -105,7 +128,10 @@ def get_items(session, params):
     else:
         items = payload
 
-    return items if isinstance(items, list) else [], response.url, payload
+    if not isinstance(items, list):
+        items = []
+
+    return items, response.url
 
 
 async def collect():
@@ -117,13 +143,24 @@ async def collect():
         "Origin": "https://www.psc.guru",
     })
 
-    # The same endpoint can be queried globally and by subject.
     subjects = [
         None,
-        "computer", "constitution", "economy", "english", "environment",
-        "geography", "history", "international", "iq-non-verbal",
-        "iq-numerical", "iq-verbal", "literature-culture", "mathematics",
-        "nepali", "public-admin", "science-tech",
+        "computer",
+        "constitution",
+        "economy",
+        "english",
+        "environment",
+        "geography",
+        "history",
+        "international",
+        "iq-non-verbal",
+        "iq-numerical",
+        "iq-verbal",
+        "literature-culture",
+        "mathematics",
+        "nepali",
+        "public-admin",
+        "science-tech",
     ]
 
     seen_ids = set()
@@ -134,11 +171,12 @@ async def collect():
         subject_name = subject or "ALL"
         Actor.log.info(f"START {subject_name}")
 
-        # First establish whether pagination actually changes the result set.
-        previous_first_ids = set()
-        repeated_pages = 0
+        # The API's `page` parameter produces changing samples, but it is not
+        # guaranteed to be a strict non-overlapping offset. Keep every unique
+        # question and stop after a run of pages that adds nothing new.
+        no_new_pages = 0
 
-        for page in range(1, 10001):
+        for page in range(1, MAX_PAGE + 1):
             params = {
                 "mode": "practice",
                 "page": page,
@@ -148,7 +186,7 @@ async def collect():
                 params["subject"] = subject
 
             try:
-                items, source_url, payload = get_items(session, params)
+                items, source_url = get_items(session, params)
             except Exception as exc:
                 Actor.log.warning(
                     f"REQUEST FAILED subject={subject_name} page={page}: {exc}"
@@ -156,20 +194,11 @@ async def collect():
                 break
 
             if not items:
-                Actor.log.info(
-                    f"END {subject_name}: empty page {page}"
-                )
+                Actor.log.info(f"END {subject_name}: empty page {page}")
                 break
 
-            first_id = items[0].get("id") if isinstance(items[0], dict) else None
-            if first_id and first_id in previous_first_ids:
-                repeated_pages += 1
-            else:
-                repeated_pages = 0
-                if first_id:
-                    previous_first_ids.add(first_id)
-
             added = 0
+
             for item in items:
                 record = build_record(item, source_url)
                 if not record:
@@ -192,14 +221,19 @@ async def collect():
                 total += 1
                 added += 1
 
+            if added == 0:
+                no_new_pages += 1
+            else:
+                no_new_pages = 0
+
             Actor.log.info(
-                f"{subject_name} page={page} returned={len(items)} added={added} total={total}"
+                f"{subject_name} page={page} returned={len(items)} "
+                f"added={added} total={total}"
             )
 
-            # API appears to recycle the same page after a point; stop rather than loop.
-            if repeated_pages >= MAX_REPEATED_PAGES:
+            if no_new_pages >= 5:
                 Actor.log.info(
-                    f"STOP {subject_name}: repeated API page detected"
+                    f"STOP {subject_name}: 5 consecutive pages with no new MCQs"
                 )
                 break
 
@@ -209,7 +243,9 @@ async def collect():
                 )
                 break
 
-    Actor.log.info(f"DONE | unique MCQs={total}")
+    Actor.log.info(
+        f"DONE | unique MCQs={total} | unique IDs={len(seen_ids)}"
+    )
 
 
 async def main():
