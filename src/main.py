@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import traceback
 from urllib.parse import urlparse
 
@@ -25,27 +26,28 @@ async def first_visible(page, selectors):
     return None
 
 
-async def login(page, email, password, start_url):
-    await Actor.log.info(f"Opening PSC Guru: {start_url}")
-    await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
+async def login(page, email, password):
+    Actor.log.info(f"Opening PSC Guru: {START_URL}")
+    await page.goto(START_URL, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(1500)
-    await Actor.log.info(f"Initial page URL: {page.url}")
+    Actor.log.info(f"Initial page URL: {page.url}")
 
-    password_probe = page.locator('input[type="password"]').first
-    try:
-        password_visible = await password_probe.is_visible()
-    except Exception:
-        password_visible = False
+    if "login" not in page.url.lower():
+        password_input = page.locator('input[type="password"]').first
+        try:
+            if not await password_input.is_visible():
+                Actor.log.info("Already authenticated; no login form detected.")
+                return
+        except Exception:
+            Actor.log.info("Already authenticated; no login form detected.")
+            return
 
-    if "login" not in page.url.lower() and not password_visible:
-        await Actor.log.info("Already authenticated; login form not detected.")
-        return
+    Actor.log.info("Login form detected; filling credentials.")
 
     email_input = await first_visible(page, [
         'input[type="email"]',
         'input[name*="email" i]',
         'input[placeholder*="email" i]',
-        'input[type="text"]',
     ])
     password_input = await first_visible(page, [
         'input[type="password"]',
@@ -55,7 +57,6 @@ async def login(page, email, password, start_url):
     if not email_input or not password_input:
         raise RuntimeError("PSC Guru login form was not detected.")
 
-    await Actor.log.info("Login form detected; submitting credentials.")
     await email_input.fill(email)
     await password_input.fill(password)
 
@@ -71,21 +72,23 @@ async def login(page, email, password, start_url):
 
     await submit.click()
     try:
-        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        await page.wait_for_load_state("domcontentloaded", timeout=60000)
     except Exception:
-        pass
-    await page.wait_for_timeout(2500)
-    await Actor.log.info(f"Post-login URL: {page.url}")
+        Actor.log.warning("Post-login navigation did not reach domcontentloaded; continuing.")
+    await page.wait_for_timeout(2000)
+
+    Actor.log.info(f"Post-login page URL: {page.url}")
 
     if "login" in page.url.lower():
-        raise RuntimeError("PSC Guru login did not complete. Check Actor input credentials.")
+        raise RuntimeError("PSC Guru login did not complete. Check Actor input email/password.")
 
 
-async def extract_questions(page, source_url):
+async def extract_question(page, source_url):
     containers = page.locator(
         '[data-question], [class*="question" i], article, .card, li'
     )
-    count = min(await containers.count(), 300)
+    count = min(await containers.count(), 200)
+
     results = []
     seen = set()
 
@@ -100,17 +103,19 @@ async def extract_questions(page, source_url):
 
         lines = [clean(x) for x in raw.split("\n") if clean(x)]
         opts = []
-        option_indexes = []
+        first_opt = None
+
         for idx, line in enumerate(lines):
             m = re.match(r"^([A-D])[.)\s]+(.+)$", line, re.I)
             if m:
+                if first_opt is None:
+                    first_opt = idx
                 opts.append({"label": m.group(1).upper(), "text": clean(m.group(2))})
-                option_indexes.append(idx)
 
-        if len(opts) < 2 or not option_indexes:
+        if len(opts) < 2 or first_opt is None:
             continue
 
-        qtext = clean(" ".join(lines[: option_indexes[0]]))
+        qtext = clean(" ".join(lines[:first_opt]))
         if len(qtext) < 8:
             continue
 
@@ -118,6 +123,7 @@ async def extract_questions(page, source_url):
         if key in seen:
             continue
         seen.add(key)
+
         results.append({
             "question": qtext,
             "options": opts[:4],
@@ -129,25 +135,23 @@ async def extract_questions(page, source_url):
 
 async def run():
     actor_input = await Actor.get_input() or {}
-    await Actor.log.info(f"Actor input keys: {sorted(actor_input.keys())}")
+    Actor.log.info(f"Actor input keys: {sorted(actor_input.keys())}")
 
     email = actor_input.get("email") or os.environ.get("PSC_GURU_EMAIL")
     password = actor_input.get("password") or os.environ.get("PSC_GURU_PASSWORD")
-    start_url = actor_input.get("startUrl") or START_URL
+    start_url = actor_input.get("startUrl", START_URL)
     max_pages = int(actor_input.get("maxPages", 100))
     max_questions = int(actor_input.get("maxQuestions", 10000))
 
     if not email or not password:
         raise RuntimeError(
-            "Missing credentials. Provide email/password in Actor input or PSC_GURU_EMAIL/PSC_GURU_PASSWORD secrets."
+            "Provide PSC Guru credentials in Actor input or PSC_GURU_EMAIL/PSC_GURU_PASSWORD secrets."
         )
 
-    await Actor.log.info(
-        f"Starting collector | maxPages={max_pages} | maxQuestions={max_questions}"
-    )
+    Actor.log.info("Starting PSC Guru collector...")
 
     async with async_playwright() as pw:
-        await Actor.log.info("Launching Chromium")
+        Actor.log.info("Launching Chromium...")
         browser = await pw.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (compatible; PSC-Guru-Apify-Collector/1.0)"
@@ -155,9 +159,10 @@ async def run():
         page = await context.new_page()
 
         try:
-            await login(page, email, password, start_url)
+            await login(page, email, password)
             await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(1000)
+            Actor.log.info(f"Starting crawl at: {page.url}")
 
             visited = set()
             emitted = set()
@@ -173,10 +178,10 @@ async def run():
                     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     await page.wait_for_timeout(1000)
                 except Exception as exc:
-                    await Actor.log.warning(f"Page failed: {url} :: {exc}")
+                    Actor.log.warning(f"Page failed: {url} :: {exc}")
                     continue
 
-                questions = await extract_questions(page, url)
+                questions = await extract_question(page, url)
                 for q in questions:
                     key = clean(q["question"]).casefold()
                     if key in emitted:
@@ -199,22 +204,19 @@ async def run():
                     if not href or href in visited or href in queue:
                         continue
                     parsed = urlparse(href)
-                    if parsed.netloc and parsed.netloc not in ("psc.guru", "www.psc.guru"):
+                    if parsed.netloc and parsed.netloc != "www.psc.guru":
                         continue
                     low = (href + " " + label).lower()
                     if any(k in low for k in ("mcq", "practice", "question", "quiz")):
                         queue.append(href)
 
-                await Actor.log.info(
-                    f"Visited {len(visited)} pages | emitted {len(emitted)} unique MCQs | queue={len(queue)}"
+                Actor.log.info(
+                    f"Visited {len(visited)} pages | emitted {len(emitted)} unique MCQs | queue {len(queue)}"
                 )
 
-            await Actor.log.info(
-                f"Collector finished | visited={len(visited)} | emitted={len(emitted)}"
-            )
         finally:
-            await context.close()
             await browser.close()
+            Actor.log.info("Browser closed.")
 
 
 async def main():
@@ -222,11 +224,10 @@ async def main():
         try:
             await run()
         except Exception as exc:
-            await Actor.log.error(f"FATAL: {type(exc).__name__}: {exc}")
-            await Actor.log.error(traceback.format_exc())
+            Actor.log.error(f"FATAL: {type(exc).__name__}: {exc}")
+            Actor.log.error(traceback.format_exc())
             raise
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
