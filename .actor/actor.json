@@ -4,5 +4,5 @@
   "title": "PSC Guru MCQ Collector",
   "version": "1.0",
   "build": {"dockerfile": "./Dockerfile"},
-  "input": "./.actor/input_schema.json"
+  "input": "../input_schema.json"
 }
