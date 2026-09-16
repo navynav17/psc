@@ -1,13 +1,14 @@
 import asyncio
 import json
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
+
 from apify import Actor
 
 START_URL = "https://www.psc.guru/mcqs/practice"
+API_BASE = "https://api.psc.guru/api"
 
 
 def clean(value):
@@ -16,188 +17,228 @@ def clean(value):
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def extract_urls_from_js(text, origin):
-    urls = set()
-
-    # Real absolute URLs
-    for m in re.findall(r'https?://[^"\'\s\\<>]+', text):
-        urls.add(m)
-
-    # API-like relative paths
-    for m in re.findall(r'["\'](/(?:api|trpc|graphql)[^"\']*)["\']', text, re.I):
-        urls.add(urljoin(origin, m))
-
-    # Fetch strings containing likely data endpoints
-    for m in re.findall(r'["\']([^"\']*(?:mcq|question|quiz|practice|exam)[^"\']*)["\']', text, re.I):
-        if m.startswith("/") and len(m) < 300 and not any(x in m.lower() for x in ("static", "chunk", "svg", "css")):
-            urls.add(urljoin(origin, m))
-
-    return urls
+def normalize_question(text):
+    return clean(text).casefold()
 
 
-def extract_questions(obj, source_url, results=None, seen=None):
-    if results is None:
-        results = []
-    if seen is None:
-        seen = set()
+def normalize_options(content):
+    if not isinstance(content, dict):
+        return []
 
-    if isinstance(obj, dict):
-        q = None
-        for key in ("question", "questionText", "question_text", "prompt"):
-            if isinstance(obj.get(key), str) and len(clean(obj[key])) >= 8:
-                q = clean(obj[key])
+    value = content.get("options")
+    if not isinstance(value, (list, dict)):
+        return []
+
+    output = []
+
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if isinstance(item, dict):
+                text = clean(
+                    item.get("text")
+                    or item.get("label")
+                    or item.get("value")
+                    or item.get("answer")
+                )
+            else:
+                text = clean(item)
+
+            if text:
+                output.append({
+                    "label": chr(65 + index) if index < 26 else str(index + 1),
+                    "text": text,
+                })
+    else:
+        for label, item in value.items():
+            if isinstance(item, dict):
+                text = clean(
+                    item.get("text")
+                    or item.get("label")
+                    or item.get("value")
+                    or item.get("answer")
+                )
+            else:
+                text = clean(item)
+
+            if text:
+                output.append({
+                    "label": str(label),
+                    "text": text,
+                })
+
+    return output
+
+
+def build_record(item, source_url):
+    if not isinstance(item, dict):
+        return None
+
+    question = clean(
+        item.get("questionText")
+        or item.get("question")
+        or item.get("text")
+    )
+
+    if len(question) < 5:
+        return None
+
+    options = normalize_options(item.get("content"))
+    if len(options) < 2:
+        return None
+
+    record = {
+        "id": item.get("id"),
+        "question": question,
+        "options": options,
+        "correctAnswer": item.get("correctAnswer"),
+        "tags": item.get("tags", []),
+        "source": "PSC Guru",
+        "source_url": source_url,
+    }
+
+    for field in (
+        "explanation",
+        "explanationText",
+        "solution",
+        "subject",
+        "difficulty",
+        "category",
+        "exam",
+        "examType",
+    ):
+        if item.get(field) is not None:
+            record[field] = item[field]
+
+    return record
+
+
+def fetch_page(session, mode, subject=None, page=1, count=100):
+    params = {
+        "mode": mode,
+        "page": page,
+        "count": count,
+    }
+
+    if subject:
+        params["subject"] = subject
+
+    response = session.get(
+        f"{API_BASE}/questions",
+        params=params,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if isinstance(payload, dict):
+        items = payload.get("items")
+        if items is None:
+            items = payload.get("questions")
+        if items is None and isinstance(payload.get("data"), list):
+            items = payload["data"]
+    else:
+        items = payload
+
+    if not isinstance(items, list):
+        items = []
+
+    return items, response.url, payload
+
+
+async def collect():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": START_URL,
+        "Origin": "https://www.psc.guru",
+    })
+
+    subjects = [
+        None,
+        "computer",
+        "constitution",
+        "economy",
+        "english",
+        "environment",
+        "geography",
+        "history",
+        "international",
+        "iq-non-verbal",
+        "iq-numerical",
+        "iq-verbal",
+        "literature-culture",
+        "mathematics",
+        "nepali",
+        "public-admin",
+        "science-tech",
+    ]
+
+    seen = set()
+    total = 0
+    page_size = 100
+
+    Actor.log.info(f"PSC Guru API: {API_BASE}")
+
+    for subject in subjects:
+        page = 1
+        subject_name = subject or "ALL"
+        Actor.log.info(f"Starting subject: {subject_name}")
+
+        while True:
+            try:
+                items, source_url, payload = fetch_page(
+                    session,
+                    mode="practice",
+                    subject=subject,
+                    page=page,
+                    count=page_size,
+                )
+            except Exception as exc:
+                Actor.log.warning(
+                    f"Request failed subject={subject_name} page={page}: {exc}"
+                )
                 break
 
-        options_value = None
-        for key in ("options", "choices", "alternatives"):
-            if isinstance(obj.get(key), (list, dict)):
-                options_value = obj[key]
+            if not items:
+                Actor.log.info(
+                    f"No items: subject={subject_name} page={page}"
+                )
                 break
 
-        options = []
-        if isinstance(options_value, list):
-            for i, item in enumerate(options_value):
-                if isinstance(item, dict):
-                    text = clean(item.get("text") or item.get("label") or item.get("value") or item.get("answer"))
-                else:
-                    text = clean(item)
-                if text:
-                    options.append({"label": chr(65 + i) if i < 26 else str(i + 1), "text": text})
-        elif isinstance(options_value, dict):
-            for label, item in options_value.items():
-                if isinstance(item, dict):
-                    text = clean(item.get("text") or item.get("label") or item.get("value") or item.get("answer"))
-                else:
-                    text = clean(item)
-                if text:
-                    options.append({"label": str(label), "text": text})
+            added = 0
 
-        if q and len(options) >= 2:
-            k = q.casefold()
-            if k not in seen:
-                seen.add(k)
-                record = {
-                    "question": q,
-                    "options": options[:10],
-                    "source": "PSC Guru",
-                    "source_url": source_url,
-                }
-                for key in ("correctAnswer", "correct_answer", "answer", "correctOption", "correct_option", "solution", "explanation", "chapter", "subject", "category", "exam", "examType", "difficulty", "id", "questionId", "question_id"):
-                    if key in obj and obj[key] not in (None, ""):
-                        record[key] = obj[key]
-                results.append(record)
+            for item in items:
+                record = build_record(item, source_url)
+                if not record:
+                    continue
 
-        for value in obj.values():
-            extract_questions(value, source_url, results, seen)
+                key = normalize_question(record["question"])
+                if not key or key in seen:
+                    continue
 
-    elif isinstance(obj, list):
-        for item in obj:
-            extract_questions(item, source_url, results, seen)
+                seen.add(key)
+                await Actor.push_data(record)
+                total += 1
+                added += 1
 
-    return results
+            Actor.log.info(
+                f"subject={subject_name} page={page} returned={len(items)} "
+                f"added={added} total={total}"
+            )
 
+            if len(items) < page_size:
+                break
 
-def discover_next_chunks(html, origin):
-    soup = BeautifulSoup(html, "html.parser")
-    chunks = set()
-    for script in soup.find_all("script", src=True):
-        src = script.get("src", "")
-        if "_next/static/" in src and src.endswith(".js"):
-            chunks.add(urljoin(origin, src))
-    return chunks
+            page += 1
 
-
-def fetch(session, url):
-    r = session.get(url, timeout=60)
-    r.raise_for_status()
-    return r
+    Actor.log.info(f"DONE | total unique MCQs: {total}")
 
 
 async def main():
     async with Actor:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
-        })
-
-        parsed = urlparse(START_URL)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-
-        Actor.log.info(f"Downloading {START_URL}")
-        page = fetch(session, START_URL)
-        html = page.text
-        Actor.log.info(f"HTTP {page.status_code} | {len(html):,} bytes")
-
-        chunks = discover_next_chunks(html, origin)
-        Actor.log.info(f"Discovered {len(chunks)} Next.js chunks")
-
-        endpoint_candidates = set()
-        all_questions = []
-        seen_questions = set()
-
-        # Scan chunks for API/data endpoint strings.
-        for index, chunk_url in enumerate(sorted(chunks), 1):
-            try:
-                r = fetch(session, chunk_url)
-                urls = extract_urls_from_js(r.text, origin)
-                if urls:
-                    Actor.log.info(f"Chunk {index}/{len(chunks)} -> {len(urls)} endpoint-like URLs")
-                endpoint_candidates.update(urls)
-            except Exception as exc:
-                Actor.log.warning(f"Chunk failed: {chunk_url} :: {exc}")
-
-        # Keep only same-site candidates likely to return data.
-        filtered = set()
-        for url in endpoint_candidates:
-            try:
-                p = urlparse(url)
-            except Exception:
-                continue
-            if p.netloc and p.netloc != parsed.netloc:
-                continue
-            low = url.lower()
-            if any(x in low for x in ("/api/", "/trpc/", "/graphql", "mcq", "question", "quiz", "practice")):
-                filtered.add(url)
-
-        Actor.log.info(f"Candidate data endpoints after filtering: {len(filtered)}")
-
-        for index, url in enumerate(sorted(filtered), 1):
-            try:
-                Actor.log.info(f"Trying {index}/{len(filtered)}: {url}")
-                r = fetch(session, url)
-                ctype = r.headers.get("content-type", "").lower()
-                body = r.text.lstrip()
-                if "json" not in ctype and not body.startswith(("{", "[")):
-                    continue
-                payload = r.json()
-                found = extract_questions(payload, url)
-                added = 0
-                for item in found:
-                    k = item["question"].casefold()
-                    if k in seen_questions:
-                        continue
-                    seen_questions.add(k)
-                    all_questions.append(item)
-                    await Actor.push_data(item)
-                    added += 1
-                if added:
-                    Actor.log.info(f"FOUND {added}; total MCQs {len(all_questions)}")
-            except Exception as exc:
-                Actor.log.info(f"Skipped {url}: {exc}")
-
-        # Diagnostic record when no endpoint produced questions.
-        if not all_questions:
-            await Actor.push_data({
-                "source": "PSC Guru",
-                "type": "diagnostic",
-                "source_url": START_URL,
-                "message": "No MCQs extracted. Inspect endpoint candidates or runtime requests.",
-                "candidate_count": len(filtered),
-                "sample_candidates": sorted(filtered)[:100],
-            })
-
-        Actor.log.info(f"DONE | unique MCQs extracted: {len(all_questions)}")
+        await collect()
 
 
 if __name__ == "__main__":
