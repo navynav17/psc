@@ -2,22 +2,17 @@ import asyncio
 import re
 
 import requests
-
 from apify import Actor
 
 START_URL = "https://www.psc.guru/mcqs/practice"
 API_BASE = "https://api.psc.guru/api"
-REQUEST_COUNT = 5000
+COUNT = 5000
 
 
 def clean(value):
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value)).strip()
-
-
-def normalize_question(text):
-    return clean(text).casefold()
 
 
 def normalize_options(content):
@@ -31,12 +26,7 @@ def normalize_options(content):
     if isinstance(value, list):
         for index, item in enumerate(value):
             if isinstance(item, dict):
-                text = clean(
-                    item.get("text")
-                    or item.get("label")
-                    or item.get("value")
-                    or item.get("answer")
-                )
+                text = clean(item.get("text") or item.get("label") or item.get("value") or item.get("answer"))
                 key = item.get("key") or (chr(65 + index) if index < 26 else str(index + 1))
             else:
                 text = clean(item)
@@ -46,12 +36,7 @@ def normalize_options(content):
     else:
         for label, item in value.items():
             if isinstance(item, dict):
-                text = clean(
-                    item.get("text")
-                    or item.get("label")
-                    or item.get("value")
-                    or item.get("answer")
-                )
+                text = clean(item.get("text") or item.get("label") or item.get("value") or item.get("answer"))
             else:
                 text = clean(item)
             if text:
@@ -62,12 +47,7 @@ def normalize_options(content):
 def build_record(item, source_url):
     if not isinstance(item, dict):
         return None
-
-    question = clean(
-        item.get("questionText")
-        or item.get("question")
-        or item.get("text")
-    )
+    question = clean(item.get("questionText") or item.get("question") or item.get("text"))
     if len(question) < 5:
         return None
 
@@ -101,11 +81,11 @@ def build_record(item, source_url):
     }
 
 
-def get_items(session):
-    params = {
-        "mode": "practice",
-        "count": REQUEST_COUNT,
-    }
+def fetch_mode(session, mode, subject=None, count=COUNT):
+    params = {"mode": mode, "count": count}
+    if subject:
+        params["subject"] = subject
+
     response = session.get(
         f"{API_BASE}/questions",
         params=params,
@@ -113,65 +93,55 @@ def get_items(session):
     )
     response.raise_for_status()
     payload = response.json()
-
-    if isinstance(payload, dict):
-        items = payload.get("items")
-        if items is None:
-            items = payload.get("questions")
-        if items is None and isinstance(payload.get("data"), list):
-            items = payload["data"]
-    else:
-        items = payload
-
+    items = payload.get("items", []) if isinstance(payload, dict) else payload
     return items if isinstance(items, list) else [], response.url
 
 
-async def collect():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": START_URL,
-        "Origin": "https://www.psc.guru",
-    })
+async def run_mode(session, mode, label, subject=None):
+    Actor.log.info(f"Fetching {label}: mode={mode} subject={subject or 'ALL'} count={COUNT}")
+    items, source_url = fetch_mode(session, mode, subject, COUNT)
 
-    Actor.log.info(f"Requesting PSC Guru practice pool with count={REQUEST_COUNT}")
-    items, source_url = get_items(session)
-    Actor.log.info(f"API returned {len(items)} items")
-
-    seen_ids = set()
-    seen_questions = set()
+    seen = set()
     added = 0
-
     for item in items:
         record = build_record(item, source_url)
         if not record:
             continue
-
-        qid = record.get("id")
-        qkey = normalize_question(record.get("questionText"))
-
-        if qid and qid in seen_ids:
+        qid = record.get("id") or clean(record.get("questionText")).casefold()
+        if qid in seen:
             continue
-        if qkey and qkey in seen_questions:
-            continue
-
-        if qid:
-            seen_ids.add(qid)
-        if qkey:
-            seen_questions.add(qkey)
-
+        seen.add(qid)
         await Actor.push_data(record)
         added += 1
 
-    Actor.log.info(
-        f"DONE | API items={len(items)} | unique MCQs emitted={added}"
-    )
+    Actor.log.info(f"{label}: returned={len(items)} added={added}")
+    return len(items), added
 
 
 async def main():
     async with Actor:
-        await collect()
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.psc.guru/mcqs/practice",
+            "Origin": "https://www.psc.guru",
+        })
+
+        await run_mode(session, "practice", "Practice")
+
+        try:
+            items, source_url = fetch_mode(session, "dailyQuiz", count=10)
+            Actor.log.info(f"Daily Quiz: returned={len(items)} source={source_url}")
+            for item in items:
+                record = build_record(item, source_url)
+                if record:
+                    record["mode"] = "dailyQuiz"
+                    await Actor.push_data(record)
+        except Exception as exc:
+            Actor.log.warning(f"Daily Quiz failed: {exc}")
+
+        Actor.log.info("DONE")
 
 
 if __name__ == "__main__":
