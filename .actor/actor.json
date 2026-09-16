@@ -1,0 +1,8 @@
+{
+  "actorSpecification": 1,
+  "name": "psc-guru-mcq-collector",
+  "title": "PSC Guru MCQ Collector",
+  "version": "1.0",
+  "build": {"dockerfile": "./Dockerfile"},
+  "input": "./input_schema.json"
+}
